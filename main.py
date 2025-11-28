@@ -2,14 +2,49 @@ from pathlib import Path
 import gzip
 import re
 import xml.etree.ElementTree as ET
-
-# Toggle: also empty all contained items if True
-EMPTY_ITEMS = True
+from configparser import ConfigParser
 
 BASE_DIR = Path(__file__).resolve().parent
 INPUT_DIR = BASE_DIR / "input"
 OUTPUT_DIR = BASE_DIR / "output"
+SETTINGS_PATH = BASE_DIR / "settings.ini"
 
+
+# ---------- Settings ----------
+
+def load_settings():
+    """
+    Load settings from settings.ini.
+    If the file doesn't exist, create it with default values.
+    Returns (empty_items: bool, exclude_identifiers: set[str]).
+    """
+    cfg = ConfigParser()
+
+    if not SETTINGS_PATH.exists():
+        cfg["Settings"] = {
+            "EMPTY_ITEMS": "false",
+            "EXCLUDE_ITEMS": "",
+        }
+        with SETTINGS_PATH.open("w", encoding="utf-8") as f:
+            cfg.write(f)
+        print(f"Created default settings.ini at {SETTINGS_PATH}")
+
+    cfg.read(SETTINGS_PATH, encoding="utf-8")
+
+    empty_items = cfg.getboolean("Settings", "EMPTY_ITEMS", fallback=False)
+    raw_exclude = cfg.get("Settings", "EXCLUDE_ITEMS", fallback="")
+
+    # Split on commas, semicolons, or whitespace
+    exclude_identifiers = {
+        token.strip().lower()
+        for token in re.split(r"[,\s;]+", raw_exclude)
+        if token.strip()
+    }
+
+    return empty_items, exclude_identifiers
+
+
+# ---------- File IO ----------
 
 def read_sub_as_xml(path: Path) -> ET.ElementTree:
     """
@@ -41,6 +76,8 @@ def write_xml_as_sub(tree: ET.ElementTree, out_path: Path) -> None:
     out_path.write_bytes(compressed)
 
 
+# ---------- Upgrade removal (unchanged logic) ----------
+
 def find_attr_case_insensitive(attrib: dict, name_lower: str):
     """
     Given an attrib dict and a lowercase name, return the real key
@@ -61,14 +98,6 @@ def revert_upgrade(upgrade_elem: ET.Element, parent_elem: ET.Element) -> int:
     Returns the number of attribute values changed.
     """
     changes = 0
-
-    # Example structure:
-    # <Upgrade identifier="increaseovervoltageresistance" level="3">
-    #   <PowerTransfer>
-    #       <fireprobability value="0.15"/>
-    #       <overloadvoltage value="1.8"/>
-    #   </PowerTransfer>
-    # </Upgrade>
 
     for comp_change in list(upgrade_elem):
         comp_tag = comp_change.tag
@@ -106,8 +135,6 @@ def process_upgrades(tree: ET.ElementTree) -> int:
     Returns total number of attributes reverted.
     """
     root = tree.getroot()
-
-    # Build child -> parent map
     parent_map = {child: parent for parent in root.iter() for child in parent}
 
     upgrades = list(root.iter("Upgrade"))
@@ -122,129 +149,195 @@ def process_upgrades(tree: ET.ElementTree) -> int:
     return total_changes
 
 
-# ---------- Item / inventory emptying ----------
+# ---------- Item deletion logic (new) ----------
 
-def extract_ids_from_contained(value: str) -> list[str]:
+def extract_ids_from_contained(value: str):
     """
     Given a contained string like:
-      "7989,8186,4161,511;141;874;...,,304,63,297"
+      "7989,8186,4161,511;141;874;...,304,63,297"
     return all numeric IDs as strings.
-
-    We don't care about exact slot/group structure, just the IDs.
     """
     if not value:
         return []
     return re.findall(r"\d+", value)
 
 
-def build_parent_map(root: ET.Element) -> dict[ET.Element, ET.Element]:
-    return {child: parent for parent in root.iter() for child in parent}
+def build_maps_for_items(root: ET.Element):
+    """
+    Build:
+      - parent_map: element -> parent element
+      - id_to_item: ID -> <Item> element
+      - container_to_children: container ID -> set of contained IDs
+      - child_to_containers: item ID -> set of container IDs that contain it
+    """
+    parent_map = {}
+    for parent in root.iter():
+        for child in parent:
+            parent_map[child] = parent
 
+    id_to_item = {}
+    container_to_children = {}
+    child_to_containers = {}
 
-def build_id_map(root: ET.Element) -> dict[str, ET.Element]:
-    id_map: dict[str, ET.Element] = {}
     for item in root.iter("Item"):
         item_id = item.get("ID")
         if item_id:
-            id_map[item_id] = item
-    return id_map
+            id_to_item[item_id] = item
 
-
-def recursively_delete_item(
-    item_id: str,
-    id_to_item: dict[str, ET.Element],
-    parent_map: dict[ET.Element, ET.Element],
-    visited: set[str],
-) -> int:
-    """
-    Delete the Item with the given ID, and recursively delete all items
-    contained inside it (if it has ItemContainer components with 'contained' set).
-
-    Returns the number of <Item> elements actually removed.
-    """
-    if item_id in visited:
-        return 0
-    visited.add(item_id)
-
-    item = id_to_item.get(item_id)
-    if item is None:
-        return 0
-
-    deleted_count = 0
-
-    # Recursively delete items this item contains
-    for item_container in item.findall("ItemContainer"):
-        contained = item_container.get("contained", "")
-        nested_ids = extract_ids_from_contained(contained)
-        if nested_ids:
-            for nested_id in nested_ids:
-                deleted_count += recursively_delete_item(
-                    nested_id, id_to_item, parent_map, visited
-                )
-        # Clear contained list on this container item as well
-        item_container.set("contained", "")
-
-    # Remove this item from its parent
-    parent = parent_map.get(item)
-    if parent is not None:
-        parent.remove(item)
-        deleted_count += 1
-
-    # Remove from id map so we don't try to delete it again
-    id_to_item.pop(item_id, None)
-
-    return deleted_count
-
-
-def empty_items_in_tree(tree: ET.ElementTree) -> int:
-    """
-    Empty all container items:
-      - For each ItemContainer.contained, delete all listed Items (and their nested contents).
-      - Clear the contained attribute on all ItemContainer components.
-
-    Returns the number of <Item> elements removed.
-    """
-    root = tree.getroot()
-    parent_map = build_parent_map(root)
-    id_to_item = build_id_map(root)
-
-    total_deleted = 0
-    visited: set[str] = set()
-
-    # Iterate over all Items that have ItemContainer components
-    for item in list(root.iter("Item")):
-        for item_container in item.findall("ItemContainer"):
-            contained = item_container.get("contained", "")
-            if not contained:
+        # Gather contained IDs from all ItemContainer components on this item
+        for ic in item.findall("ItemContainer"):
+            contained = ic.get("contained", "")
+            ids = extract_ids_from_contained(contained)
+            if not ids:
                 continue
 
-            ids = extract_ids_from_contained(contained)
-            if ids:
-                for cid in ids:
-                    total_deleted += recursively_delete_item(
-                        cid, id_to_item, parent_map, visited
-                    )
+            if item_id:
+                container_to_children.setdefault(item_id, set()).update(ids)
 
-            # Finally, clear the container's 'contained' attribute
-            item_container.set("contained", "")
+            for cid in ids:
+                child_to_containers.setdefault(cid, set()).add(item_id)
 
-    return total_deleted
+    return parent_map, id_to_item, container_to_children, child_to_containers
+
+
+def build_safe_ids(id_to_item, container_to_children, child_to_containers, exclude_identifiers):
+    """
+    Build the set of 'safe' IDs that must NOT be deleted.
+
+    Start from all items whose identifier is in EXCLUDE_ITEMS, then recursively:
+      - add all children they contain (downwards through ItemContainer.contained)
+      - add all parents/containers that contain them (upwards)
+    """
+    safe_ids = set()
+    queue = []
+
+    # Seed: items whose identifier is in the exclude list
+    for item_id, item in id_to_item.items():
+        identifier = (item.get("identifier") or "").lower()
+        if identifier in exclude_identifiers:
+            safe_ids.add(item_id)
+            queue.append(item_id)
+
+    # BFS across the containment graph (both directions)
+    while queue:
+        current = queue.pop()
+
+        # Children (items contained by this item)
+        for child_id in container_to_children.get(current, ()):
+            if child_id not in safe_ids:
+                safe_ids.add(child_id)
+                queue.append(child_id)
+
+        # Parents (containers that contain this item)
+        for parent_id in child_to_containers.get(current, ()):
+            if parent_id not in safe_ids:
+                safe_ids.add(parent_id)
+                queue.append(parent_id)
+
+    return safe_ids
+
+
+def item_is_deletable(item: ET.Element, safe_ids: set) -> bool:
+    """
+    Decide if an <Item> should be deleted according to:
+
+    - Not in safe_ids
+    - AND ( has <Holdable CanBePicked="True" and not Attached="True">
+           OR has <Pickable CanBePicked="True"> )
+    """
+    item_id = item.get("ID")
+    if not item_id:
+        return False
+    if item_id in safe_ids:
+        return False
+
+    # Check Holdable components
+    for holdable in item.findall("Holdable"):
+        if holdable.get("CanBePicked") == "True":
+            if holdable.get("Attached") != "True":
+                return True
+
+    # Check Pickable components
+    for pickable in item.findall("Pickable"):
+        if pickable.get("CanBePicked") == "True":
+            return True
+
+    return False
+
+
+def delete_pickable_items(tree: ET.ElementTree, exclude_identifiers: set) -> int:
+    """
+    Implements the new deletion logic:
+
+    1. Build safe-from-deletion ID set from EXCLUDE_ITEMS,
+       recursively adding all children and parents via containment.
+    2. Delete any <Item> whose ID is not safe and which is deletable
+       (Holdable or Pickable with CanBePicked="True", and not attached).
+    3. Remove deleted IDs from all ItemContainer.contained attributes.
+
+    Returns the number of <Item> elements deleted.
+    """
+    root = tree.getroot()
+
+    parent_map, id_to_item, container_to_children, child_to_containers = build_maps_for_items(root)
+    safe_ids = build_safe_ids(id_to_item, container_to_children, child_to_containers, exclude_identifiers)
+
+    deleted_ids = set()
+
+    # Step 2: delete suitable items
+    for item in list(root.iter("Item")):
+        item_id = item.get("ID")
+        if not item_id:
+            continue
+
+        if item_is_deletable(item, safe_ids):
+            parent = parent_map.get(item)
+            if parent is not None:
+                parent.remove(item)
+                deleted_ids.add(item_id)
+
+    # Step 3: clean up ItemContainer.contained references
+    if deleted_ids:
+        for item in root.iter("Item"):
+            for ic in item.findall("ItemContainer"):
+                contained = ic.get("contained", "")
+                if not contained:
+                    continue
+
+                ids = extract_ids_from_contained(contained)
+                # Keep only IDs that were NOT deleted
+                kept_ids = [cid for cid in ids if cid not in deleted_ids]
+
+                if kept_ids:
+                    ic.set("contained", ",".join(kept_ids))
+                else:
+                    ic.set("contained", "")
+
+    return len(deleted_ids)
 
 
 # ---------- File-level processing ----------
 
-def process_sub_file(path: Path, output_dir: Path) -> None:
+def process_sub_file(
+    path: Path,
+    output_dir: Path,
+    empty_items: bool,
+    exclude_identifiers: set,
+) -> None:
     print(f"Processing {path.name} ...")
 
     tree = read_sub_as_xml(path)
 
+    # 1) Upgrades
     upgrade_changes = process_upgrades(tree)
     print(f"  -> reverted {upgrade_changes} upgraded attribute(s)")
 
+    # 2) Item deletion layer
     deleted_items = 0
-    if EMPTY_ITEMS:
-        deleted_items = empty_items_in_tree(tree)
-        print(f"  -> deleted {deleted_items} contained item(s)")
+    if empty_items:
+        deleted_items = delete_pickable_items(tree, exclude_identifiers)
+        print(f"  -> deleted {deleted_items} pickable/holdable item(s) "
+              f"(safe IDs derived from {len(exclude_identifiers)} excluded identifier(s))")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / path.name
@@ -254,6 +347,13 @@ def process_sub_file(path: Path, output_dir: Path) -> None:
 
 
 def main() -> None:
+    empty_items, exclude_identifiers = load_settings()
+    print(f"EMPTY_ITEMS = {empty_items}")
+    if exclude_identifiers:
+        print(f"EXCLUDE_ITEMS = {', '.join(sorted(exclude_identifiers))}")
+    else:
+        print("EXCLUDE_ITEMS = (none)")
+
     if not INPUT_DIR.exists():
         print(f"Input folder not found: {INPUT_DIR}")
         print("Create an 'input' folder next to main.py and drop your .sub files in it.")
@@ -268,7 +368,7 @@ def main() -> None:
     print(f"Found {len(sub_files)} .sub file(s) in {INPUT_DIR}")
     for sub_path in sub_files:
         try:
-            process_sub_file(sub_path, OUTPUT_DIR)
+            process_sub_file(sub_path, OUTPUT_DIR, empty_items, exclude_identifiers)
         except Exception as e:
             print(f"  !! Error processing {sub_path.name}: {e}")
 
