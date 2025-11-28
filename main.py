@@ -76,7 +76,7 @@ def write_xml_as_sub(tree: ET.ElementTree, out_path: Path) -> None:
     out_path.write_bytes(compressed)
 
 
-# ---------- Upgrade removal (unchanged logic) ----------
+# ---------- Upgrade removal (unchanged) ----------
 
 def find_attr_case_insensitive(attrib: dict, name_lower: str):
     """
@@ -149,7 +149,7 @@ def process_upgrades(tree: ET.ElementTree) -> int:
     return total_changes
 
 
-# ---------- Item deletion logic (new) ----------
+# ---------- Item deletion utilities ----------
 
 def extract_ids_from_contained(value: str):
     """
@@ -184,7 +184,6 @@ def build_maps_for_items(root: ET.Element):
         if item_id:
             id_to_item[item_id] = item
 
-        # Gather contained IDs from all ItemContainer components on this item
         for ic in item.findall("ItemContainer"):
             contained = ic.get("contained", "")
             ids = extract_ids_from_contained(contained)
@@ -200,9 +199,14 @@ def build_maps_for_items(root: ET.Element):
     return parent_map, id_to_item, container_to_children, child_to_containers
 
 
-def build_safe_ids(id_to_item, container_to_children, child_to_containers, exclude_identifiers):
+def build_safe_ids(
+    id_to_item,
+    container_to_children,
+    child_to_containers,
+    exclude_identifiers,
+):
     """
-    Build the set of 'safe' IDs that must NOT be deleted.
+    Build the set of 'safe from deletion' IDs:
 
     Start from all items whose identifier is in EXCLUDE_ITEMS, then recursively:
       - add all children they contain (downwards through ItemContainer.contained)
@@ -222,13 +226,13 @@ def build_safe_ids(id_to_item, container_to_children, child_to_containers, exclu
     while queue:
         current = queue.pop()
 
-        # Children (items contained by this item)
+        # Children
         for child_id in container_to_children.get(current, ()):
             if child_id not in safe_ids:
                 safe_ids.add(child_id)
                 queue.append(child_id)
 
-        # Parents (containers that contain this item)
+        # Parents
         for parent_id in child_to_containers.get(current, ()):
             if parent_id not in safe_ids:
                 safe_ids.add(parent_id)
@@ -237,13 +241,16 @@ def build_safe_ids(id_to_item, container_to_children, child_to_containers, exclu
     return safe_ids
 
 
+TARGET_TAGS = {"smallitem", "mediumitem", "ammobox", "railgunammo", "human"}
+
+
 def item_is_deletable(item: ET.Element, safe_ids: set) -> bool:
     """
-    Decide if an <Item> should be deleted according to:
-
-    - Not in safe_ids
-    - AND ( has <Holdable CanBePicked="True" and not Attached="True">
-           OR has <Pickable CanBePicked="True"> )
+    Items to delete must:
+      1) Have an ID not in safe_ids
+      2) Have Tags containing at least one of:
+         smallitem, mediumitem, ammobox, railgunammo, human
+      3) NOT have a <Holdable Attached="True" ...> subnode
     """
     item_id = item.get("ID")
     if not item_id:
@@ -251,29 +258,62 @@ def item_is_deletable(item: ET.Element, safe_ids: set) -> bool:
     if item_id in safe_ids:
         return False
 
-    # Check Holdable components
+    # Check tags
+    raw_tags = (
+        item.get("Tags")
+        or item.get("tags")
+        or ""
+    )
+    tag_tokens = {
+        t.strip().lower()
+        for t in re.split(r"[,\s]+", raw_tags)
+        if t.strip()
+    }
+
+    if not (tag_tokens & TARGET_TAGS):
+        return False
+
+    # Check Holdable / Attached
     for holdable in item.findall("Holdable"):
-        if holdable.get("CanBePicked") == "True":
-            if holdable.get("Attached") != "True":
-                return True
+        attached = holdable.get("Attached")
+        if attached is not None and attached.lower() == "true":
+            # Attached holdables must not be deleted
+            return False
 
-    # Check Pickable components
-    for pickable in item.findall("Pickable"):
-        if pickable.get("CanBePicked") == "True":
-            return True
-
-    return False
+    return True
 
 
-def delete_pickable_items(tree: ET.ElementTree, exclude_identifiers: set) -> int:
+def remove_deleted_ids_from_contained(value: str, deleted_ids: set[str]) -> str:
+    """
+    Remove IDs from a contained string by deleting only the digits of IDs
+    that were deleted, preserving commas/semicolons exactly.
+
+    Example:
+      value = ",8359,7478,136,7840,,7966;48,..."
+      deleted_ids = {"7840"}
+      result = ",8359,7478,136,,,7966;48,..."
+    """
+    if not value or not deleted_ids:
+        return value
+
+    def repl(match: re.Match) -> str:
+        token = match.group(0)
+        return "" if token in deleted_ids else token
+
+    return re.sub(r"\d+", repl, value)
+
+
+def delete_tagged_items(tree: ET.ElementTree, exclude_identifiers: set) -> int:
     """
     Implements the new deletion logic:
 
     1. Build safe-from-deletion ID set from EXCLUDE_ITEMS,
        recursively adding all children and parents via containment.
-    2. Delete any <Item> whose ID is not safe and which is deletable
-       (Holdable or Pickable with CanBePicked="True", and not attached).
-    3. Remove deleted IDs from all ItemContainer.contained attributes.
+    2. Delete any <Item> whose ID is not safe and which:
+         - has required tags, and
+         - is not a Holdable with Attached="True".
+    3. Remove deleted IDs from all ItemContainer.contained attributes
+       by deleting only the digits and preserving separators.
 
     Returns the number of <Item> elements deleted.
     """
@@ -282,7 +322,7 @@ def delete_pickable_items(tree: ET.ElementTree, exclude_identifiers: set) -> int
     parent_map, id_to_item, container_to_children, child_to_containers = build_maps_for_items(root)
     safe_ids = build_safe_ids(id_to_item, container_to_children, child_to_containers, exclude_identifiers)
 
-    deleted_ids = set()
+    deleted_ids: set[str] = set()
 
     # Step 2: delete suitable items
     for item in list(root.iter("Item")):
@@ -296,22 +336,15 @@ def delete_pickable_items(tree: ET.ElementTree, exclude_identifiers: set) -> int
                 parent.remove(item)
                 deleted_ids.add(item_id)
 
-    # Step 3: clean up ItemContainer.contained references
+    # Step 3: clean up ItemContainer.contained references (preserve separators)
     if deleted_ids:
         for item in root.iter("Item"):
             for ic in item.findall("ItemContainer"):
                 contained = ic.get("contained", "")
                 if not contained:
                     continue
-
-                ids = extract_ids_from_contained(contained)
-                # Keep only IDs that were NOT deleted
-                kept_ids = [cid for cid in ids if cid not in deleted_ids]
-
-                if kept_ids:
-                    ic.set("contained", ",".join(kept_ids))
-                else:
-                    ic.set("contained", "")
+                cleaned = remove_deleted_ids_from_contained(contained, deleted_ids)
+                ic.set("contained", cleaned)
 
     return len(deleted_ids)
 
@@ -335,9 +368,11 @@ def process_sub_file(
     # 2) Item deletion layer
     deleted_items = 0
     if empty_items:
-        deleted_items = delete_pickable_items(tree, exclude_identifiers)
-        print(f"  -> deleted {deleted_items} pickable/holdable item(s) "
-              f"(safe IDs derived from {len(exclude_identifiers)} excluded identifier(s))")
+        deleted_items = delete_tagged_items(tree, exclude_identifiers)
+        print(
+            f"  -> deleted {deleted_items} item(s) "
+            f"(safe IDs derived from {len(exclude_identifiers)} excluded identifier(s))"
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / path.name
@@ -370,7 +405,7 @@ def main() -> None:
         try:
             process_sub_file(sub_path, OUTPUT_DIR, empty_items, exclude_identifiers)
         except Exception as e:
-            print(f"  !! Error processing {sub_path.name}: {e}")
+            print(f"  -> !! Error processing {sub_path.name}: {e}")
 
     print("Done.")
 
