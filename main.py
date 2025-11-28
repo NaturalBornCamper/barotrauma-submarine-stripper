@@ -251,14 +251,44 @@ def collect_link_w_ids(root: ET.Element, id_to_item: dict[str, ET.Element]) -> s
         w = link.get("w")
         if not w:
             continue
-        # Only add if this ID exists as an Item
         if w in id_to_item:
             safe_from_links.add(w)
     return safe_from_links
 
 
 # Tags that mark items as candidates for deletion (if not safe)
-TARGET_TAGS = {"smallitem", "mediumitem", "ammobox", "railgunammo", "human", "mobilecontainer"}
+TARGET_TAGS = {
+    "smallitem",
+    "mediumitem",
+    "ammobox",
+    "railgunammo",
+    "human",
+    "mobilecontainer",
+    "depthchargeammo",
+    "crate",
+}
+
+# Subnodes that indicate "held/usable" items; if none of these exist,
+# we treat the item as static and make it safe.
+BEHAVIOR_COMPONENT_TAGS = (
+    "Holdable",
+    "Throwable",
+    "Growable",
+    "Pickable",
+    "MeleeWeapon",
+    "Wearable",
+)
+
+
+def has_behavior_component(item: ET.Element) -> bool:
+    """
+    Return True if the item has at least one of the behavior component subnodes:
+    Holdable, Throwable, Growable, Pickable, MeleeWeapon, Wearable.
+    """
+    for tag in BEHAVIOR_COMPONENT_TAGS:
+        if item.find(tag) is not None:
+            return True
+    return False
 
 
 def item_is_deletable(item: ET.Element, safe_ids: set) -> bool:
@@ -266,8 +296,10 @@ def item_is_deletable(item: ET.Element, safe_ids: set) -> bool:
     Items to delete must:
       1) Have an ID not in safe_ids
       2) Have Tags containing at least one of:
-         smallitem, mediumitem, ammobox, railgunammo, human, mobilecontainer
+         smallitem, mediumitem, ammobox, railgunammo, human,
+         mobilecontainer, depthchargeammo, crate
       3) NOT have a <Holdable Attached="True" ...> subnode
+         (attached items must stay)
     """
     item_id = item.get("ID")
     if not item_id:
@@ -304,11 +336,6 @@ def remove_deleted_ids_from_contained(value: str, deleted_ids: set[str]) -> str:
     """
     Remove IDs from a contained string by deleting only the digits of IDs
     that were deleted, preserving commas/semicolons exactly.
-
-    Example:
-      value = ",8359,7478,136,7840,,7966;48,..."
-      deleted_ids = {"7840"}
-      result = ",8359,7478,136,,,7966;48,..."
     """
     if not value or not deleted_ids:
         return value
@@ -326,7 +353,10 @@ def delete_tagged_items(tree: ET.ElementTree, exclude_identifiers: set) -> int:
 
     1. Build safe-from-deletion ID set from EXCLUDE_ITEMS,
        recursively adding all children and parents via containment.
-    2. Add to safe set all IDs referenced by any <link w="...">.
+    2. Add to safe set:
+         - all IDs referenced by any <link w="...">
+         - all IDs of Items that have NO behavior component subnodes
+           (Holdable, Throwable, Growable, Pickable, MeleeWeapon, Wearable).
     3. Delete any <Item> whose ID is not safe and which:
          - has required tags, and
          - is not a Holdable with Attached="True".
@@ -340,9 +370,16 @@ def delete_tagged_items(tree: ET.ElementTree, exclude_identifiers: set) -> int:
     parent_map, id_to_item, container_to_children, child_to_containers = build_maps_for_items(root)
     safe_ids = build_safe_ids(id_to_item, container_to_children, child_to_containers, exclude_identifiers)
 
-    # Step 2: also protect all items referenced by <link w="...">
+    # Step 2a: also protect all items referenced by <link w="...">
     link_safe_ids = collect_link_w_ids(root, id_to_item)
     safe_ids.update(link_safe_ids)
+
+    # Step 2b: protect all items that have NO behavior components
+    for item_id, item in id_to_item.items():
+        if item_id in safe_ids:
+            continue
+        if not has_behavior_component(item):
+            safe_ids.add(item_id)
 
     deleted_ids: set[str] = set()
 
@@ -393,8 +430,7 @@ def process_sub_file(
         deleted_items = delete_tagged_items(tree, exclude_identifiers)
         print(
             f"  -> deleted {deleted_items} item(s) "
-            f"(safe IDs from {len(exclude_identifiers)} excluded identifier(s) "
-            f"+ {len(tree.getroot().findall('.//link'))} link(s))"
+            f"(safe IDs from excluded identifiers, links, and non-behavior items)"
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
