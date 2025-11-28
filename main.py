@@ -241,7 +241,24 @@ def build_safe_ids(
     return safe_ids
 
 
-TARGET_TAGS = {"smallitem", "mediumitem", "ammobox", "railgunammo", "human"}
+def collect_link_w_ids(root: ET.Element, id_to_item: dict[str, ET.Element]) -> set[str]:
+    """
+    Collect IDs referenced by <link w="..."> anywhere in the document.
+    Only keep those that actually correspond to an existing Item ID.
+    """
+    safe_from_links: set[str] = set()
+    for link in root.iter("link"):
+        w = link.get("w")
+        if not w:
+            continue
+        # Only add if this ID exists as an Item
+        if w in id_to_item:
+            safe_from_links.add(w)
+    return safe_from_links
+
+
+# Tags that mark items as candidates for deletion (if not safe)
+TARGET_TAGS = {"smallitem", "mediumitem", "ammobox", "railgunammo", "human", "mobilecontainer"}
 
 
 def item_is_deletable(item: ET.Element, safe_ids: set) -> bool:
@@ -249,7 +266,7 @@ def item_is_deletable(item: ET.Element, safe_ids: set) -> bool:
     Items to delete must:
       1) Have an ID not in safe_ids
       2) Have Tags containing at least one of:
-         smallitem, mediumitem, ammobox, railgunammo, human
+         smallitem, mediumitem, ammobox, railgunammo, human, mobilecontainer
       3) NOT have a <Holdable Attached="True" ...> subnode
     """
     item_id = item.get("ID")
@@ -305,14 +322,15 @@ def remove_deleted_ids_from_contained(value: str, deleted_ids: set[str]) -> str:
 
 def delete_tagged_items(tree: ET.ElementTree, exclude_identifiers: set) -> int:
     """
-    Implements the new deletion logic:
+    Deletion logic:
 
     1. Build safe-from-deletion ID set from EXCLUDE_ITEMS,
        recursively adding all children and parents via containment.
-    2. Delete any <Item> whose ID is not safe and which:
+    2. Add to safe set all IDs referenced by any <link w="...">.
+    3. Delete any <Item> whose ID is not safe and which:
          - has required tags, and
          - is not a Holdable with Attached="True".
-    3. Remove deleted IDs from all ItemContainer.contained attributes
+    4. Remove deleted IDs from all ItemContainer.contained attributes
        by deleting only the digits and preserving separators.
 
     Returns the number of <Item> elements deleted.
@@ -322,9 +340,13 @@ def delete_tagged_items(tree: ET.ElementTree, exclude_identifiers: set) -> int:
     parent_map, id_to_item, container_to_children, child_to_containers = build_maps_for_items(root)
     safe_ids = build_safe_ids(id_to_item, container_to_children, child_to_containers, exclude_identifiers)
 
+    # Step 2: also protect all items referenced by <link w="...">
+    link_safe_ids = collect_link_w_ids(root, id_to_item)
+    safe_ids.update(link_safe_ids)
+
     deleted_ids: set[str] = set()
 
-    # Step 2: delete suitable items
+    # Step 3: delete suitable items
     for item in list(root.iter("Item")):
         item_id = item.get("ID")
         if not item_id:
@@ -336,7 +358,7 @@ def delete_tagged_items(tree: ET.ElementTree, exclude_identifiers: set) -> int:
                 parent.remove(item)
                 deleted_ids.add(item_id)
 
-    # Step 3: clean up ItemContainer.contained references (preserve separators)
+    # Step 4: clean up ItemContainer.contained references (preserve separators)
     if deleted_ids:
         for item in root.iter("Item"):
             for ic in item.findall("ItemContainer"):
@@ -371,7 +393,8 @@ def process_sub_file(
         deleted_items = delete_tagged_items(tree, exclude_identifiers)
         print(
             f"  -> deleted {deleted_items} item(s) "
-            f"(safe IDs derived from {len(exclude_identifiers)} excluded identifier(s))"
+            f"(safe IDs from {len(exclude_identifiers)} excluded identifier(s) "
+            f"+ {len(tree.getroot().findall('.//link'))} link(s))"
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
