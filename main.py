@@ -149,6 +149,28 @@ def process_upgrades(tree: ET.ElementTree) -> int:
     return total_changes
 
 
+def remove_extra_stacksize_stats(tree: ET.ElementTree) -> int:
+    """
+    Remove every <Stat> node whose type/Type attribute is 'ExtraStackSize'
+    (case-insensitive), e.g.:
+      <Stat type="ExtraStackSize" talent="jengamaster" value="4"/>
+    Returns the number of Stat nodes removed.
+    """
+    root = tree.getroot()
+    # Build parent map so we can remove Stat elements
+    parent_map = {child: parent for parent in root.iter() for child in parent}
+
+    removed = 0
+    for stat in list(root.iter("Stat")):
+        t = stat.get("type") or stat.get("Type")
+        if t and t.lower() == "extrastacksize":
+            parent = parent_map.get(stat)
+            if parent is not None:
+                parent.remove(stat)
+                removed += 1
+    return removed
+
+
 # ---------- Item deletion utilities ----------
 
 def extract_ids_from_contained(value: str):
@@ -423,6 +445,10 @@ def process_sub_file(
     # 1) Upgrades
     upgrade_changes = process_upgrades(tree)
     print(f"  -> reverted {upgrade_changes} upgraded attribute(s)")
+
+    # 1b) Remove ExtraStackSize Stat nodes (e.g. from jengamaster)
+    extra_stack_removed = remove_extra_stacksize_stats(tree)
+    print(f"  -> removed {extra_stack_removed} ExtraStackSize Stat node(s)")
 
     # 2) Item deletion layer
     deleted_items = 0
