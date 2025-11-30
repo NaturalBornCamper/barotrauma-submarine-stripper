@@ -16,13 +16,14 @@ def load_settings():
     """
     Load settings from settings.ini.
     If the file doesn't exist, create it with default values.
-    Returns (empty_items: bool, exclude_identifiers: set[str]).
+    Returns (strip_items: bool, exclude_identifiers: set[str], strip_upgrades: bool).
     """
     cfg = ConfigParser()
 
     if not SETTINGS_PATH.exists():
         cfg["Settings"] = {
-            "EMPTY_ITEMS": "false",
+            "STRIP_ITEMS": "false",
+            "STRIP_UPGRADES": "true",
             "EXCLUDE_ITEMS": "",
         }
         with SETTINGS_PATH.open("w", encoding="utf-8") as f:
@@ -31,7 +32,8 @@ def load_settings():
 
     cfg.read(SETTINGS_PATH, encoding="utf-8")
 
-    empty_items = cfg.getboolean("Settings", "EMPTY_ITEMS", fallback=False)
+    strip_items = cfg.getboolean("Settings", "STRIP_ITEMS", fallback=False)
+    strip_upgrades = cfg.getboolean("Settings", "STRIP_UPGRADES", fallback=True)
     raw_exclude = cfg.get("Settings", "EXCLUDE_ITEMS", fallback="")
 
     # Split on commas, semicolons, or whitespace
@@ -41,7 +43,7 @@ def load_settings():
         if token.strip()
     }
 
-    return empty_items, exclude_identifiers
+    return strip_items, exclude_identifiers, strip_upgrades
 
 
 # ---------- File IO ----------
@@ -76,7 +78,7 @@ def write_xml_as_sub(tree: ET.ElementTree, out_path: Path) -> None:
     out_path.write_bytes(compressed)
 
 
-# ---------- Upgrade removal (unchanged) ----------
+# ---------- Upgrade removal ----------
 
 def find_attr_case_insensitive(attrib: dict, name_lower: str):
     """
@@ -157,7 +159,6 @@ def remove_extra_stacksize_stats(tree: ET.ElementTree) -> int:
     Returns the number of Stat nodes removed.
     """
     root = tree.getroot()
-    # Build parent map so we can remove Stat elements
     parent_map = {child: parent for parent in root.iter() for child in parent}
 
     removed = 0
@@ -435,29 +436,34 @@ def delete_tagged_items(tree: ET.ElementTree, exclude_identifiers: set) -> int:
 def process_sub_file(
     path: Path,
     output_dir: Path,
-    empty_items: bool,
+    strip_items: bool,
     exclude_identifiers: set,
+    strip_upgrades: bool,
 ) -> None:
     print(f"Processing {path.name} ...")
 
     tree = read_sub_as_xml(path)
 
-    # 1) Upgrades
-    upgrade_changes = process_upgrades(tree)
-    print(f"  -> reverted {upgrade_changes} upgraded attribute(s)")
+    # 1) Upgrades (optional)
+    if strip_upgrades:
+        upgrade_changes = process_upgrades(tree)
+        print(f"  -> reverted {upgrade_changes} upgraded attribute(s)")
 
-    # 1b) Remove ExtraStackSize Stat nodes (e.g. from jengamaster)
-    extra_stack_removed = remove_extra_stacksize_stats(tree)
-    print(f"  -> removed {extra_stack_removed} ExtraStackSize Stat node(s)")
+        extra_stack_removed = remove_extra_stacksize_stats(tree)
+        print(f"  -> removed {extra_stack_removed} ExtraStackSize Stat node(s)")
+    else:
+        print("  -> skipping upgrade stripping (STRIP_UPGRADES = false)")
 
     # 2) Item deletion layer
     deleted_items = 0
-    if empty_items:
+    if strip_items:
         deleted_items = delete_tagged_items(tree, exclude_identifiers)
         print(
             f"  -> deleted {deleted_items} item(s) "
             f"(safe IDs from excluded identifiers, links, and non-behavior items)"
         )
+    else:
+        print("  -> skipping item stripping (STRIP_ITEMS = false)")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / path.name
@@ -467,8 +473,9 @@ def process_sub_file(
 
 
 def main() -> None:
-    empty_items, exclude_identifiers = load_settings()
-    print(f"EMPTY_ITEMS = {empty_items}")
+    strip_items, exclude_identifiers, strip_upgrades = load_settings()
+    print(f"STRIP_ITEMS = {strip_items}")
+    print(f"STRIP_UPGRADES = {strip_upgrades}")
     if exclude_identifiers:
         print(f"EXCLUDE_ITEMS = {', '.join(sorted(exclude_identifiers))}")
     else:
@@ -488,7 +495,7 @@ def main() -> None:
     print(f"Found {len(sub_files)} .sub file(s) in {INPUT_DIR}")
     for sub_path in sub_files:
         try:
-            process_sub_file(sub_path, OUTPUT_DIR, empty_items, exclude_identifiers)
+            process_sub_file(sub_path, OUTPUT_DIR, strip_items, exclude_identifiers, strip_upgrades)
         except Exception as e:
             print(f"  -> !! Error processing {sub_path.name}: {e}")
 
