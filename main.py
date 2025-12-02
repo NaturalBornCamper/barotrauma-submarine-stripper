@@ -44,7 +44,7 @@ def load_settings():
     """
     Load settings from settings.ini.
     If the file doesn't exist, create it with default values.
-    Returns (strip_items: bool, exclude_identifiers: set[str], strip_upgrades: bool).
+    Returns (strip_items: bool, strip_upgrades: bool).
     """
     cfg = ConfigParser()
 
@@ -52,7 +52,6 @@ def load_settings():
         cfg["Settings"] = {
             "STRIP_ITEMS": "false",
             "STRIP_UPGRADES": "true",
-            "EXCLUDE_ITEMS": "",
         }
         with SETTINGS_PATH.open("w", encoding="utf-8") as f:
             cfg.write(f)
@@ -63,26 +62,10 @@ def load_settings():
     strip_items = safe_getboolean(cfg, "Settings", "STRIP_ITEMS", False)
     strip_upgrades = safe_getboolean(cfg, "Settings", "STRIP_UPGRADES", True)
 
-    try:
-        raw_exclude = cfg.get("Settings", "EXCLUDE_ITEMS")
-    except Exception as e:
-        print(f"[WARN] EXCLUDE_ITEMS missing or invalid in settings.ini: {e!r}. Using empty list.")
-        raw_exclude = ""
-
-    exclude_identifiers = {
-        token.strip().lower()
-        for token in re.split(r"[,\s;]+", raw_exclude)
-        if token.strip()
-    }
-
     print(f"[INFO] STRIP_ITEMS = {strip_items}")
     print(f"[INFO] STRIP_UPGRADES = {strip_upgrades}")
-    if exclude_identifiers:
-        print(f"[INFO] EXCLUDE_ITEMS = {', '.join(sorted(exclude_identifiers))}")
-    else:
-        print("[INFO] EXCLUDE_ITEMS = (none)")
 
-    return strip_items, exclude_identifiers, strip_upgrades
+    return strip_items, strip_upgrades
 
 
 # ---------- File IO ----------
@@ -117,7 +100,7 @@ def write_xml_as_sub(tree: ET.ElementTree, out_path: Path) -> None:
     out_path.write_bytes(compressed)
 
 
-# ---------- Upgrade removal ----------
+# ---------- Upgrade removal (unchanged) ----------
 
 def find_attr_case_insensitive(attrib: dict, name_lower: str):
     """
@@ -210,123 +193,7 @@ def remove_extra_stacksize_stats(tree: ET.ElementTree) -> int:
     return removed
 
 
-# ---------- Item deletion utilities ----------
-
-def extract_ids_from_contained(value: str):
-    """
-    Given a contained string like:
-      "7989,8186,4161,511;141;874;...,304,63,297"
-    return all numeric IDs as strings.
-    """
-    if not value:
-        return []
-    return re.findall(r"\d+", value)
-
-
-def build_maps_for_items(root: ET.Element):
-    """
-    Build:
-      - parent_map: element -> parent element
-      - id_to_item: ID -> <Item> element
-      - container_to_children: container ID -> set of contained IDs
-      - child_to_containers: item ID -> set of container IDs that contain it
-    """
-    parent_map = {}
-    for parent in root.iter():
-        for child in parent:
-            parent_map[child] = parent
-
-    id_to_item = {}
-    container_to_children = {}
-    child_to_containers = {}
-
-    for item in root.iter("Item"):
-        item_id = item.get("ID")
-        if item_id:
-            id_to_item[item_id] = item
-
-        for ic in item.findall("ItemContainer"):
-            contained = ic.get("contained", "")
-            ids = extract_ids_from_contained(contained)
-            if not ids:
-                continue
-
-            if item_id:
-                container_to_children.setdefault(item_id, set()).update(ids)
-
-            for cid in ids:
-                child_to_containers.setdefault(cid, set()).add(item_id)
-
-    return parent_map, id_to_item, container_to_children, child_to_containers
-
-
-def build_safe_ids(
-    id_to_item,
-    container_to_children,
-    child_to_containers,
-    exclude_identifiers,
-):
-    """
-    Build the set of 'safe from deletion' IDs:
-
-    Start from all items whose identifier is in EXCLUDE_ITEMS, then recursively:
-      - add all children they contain (downwards via ItemContainer.contained)
-      - add all parents/containers that contain them (upwards)
-    """
-    safe_ids = set()
-    queue = []
-
-    # Seed: items whose identifier is in the exclude list
-    for item_id, item in id_to_item.items():
-        identifier = (item.get("identifier") or "").lower()
-        if identifier in exclude_identifiers:
-            safe_ids.add(item_id)
-            queue.append(item_id)
-
-    # BFS across the containment graph (both directions)
-    while queue:
-        current = queue.pop()
-
-        # Children
-        for child_id in container_to_children.get(current, ()):
-            if child_id not in safe_ids:
-                safe_ids.add(child_id)
-                queue.append(child_id)
-
-        # Parents
-        for parent_id in child_to_containers.get(current, ()):
-            if parent_id not in safe_ids:
-                safe_ids.add(parent_id)
-                queue.append(parent_id)
-
-    return safe_ids
-
-
-def collect_link_w_ids(root: ET.Element, id_to_item: dict[str, ET.Element]) -> set[str]:
-    """
-    Collect IDs referenced by <link w="..."> anywhere in the document.
-    Only keep those that actually correspond to an existing Item ID.
-    """
-    safe_from_links: set[str] = set()
-    for link in root.iter("link"):
-        w = link.get("w")
-        if not w:
-            continue
-        if w in id_to_item:
-            safe_from_links.add(w)
-    return safe_from_links
-
-
-TARGET_TAGS = {
-    "smallitem",
-    "mediumitem",
-    "ammobox",
-    "railgunammo",
-    "human",
-    "mobilecontainer",
-    "depthchargeammo",
-    "crate",
-}
+# ---------- Item deletion (new SAFE_LIST-based logic) ----------
 
 BEHAVIOR_COMPONENT_TAGS = (
     "Holdable",
@@ -335,6 +202,7 @@ BEHAVIOR_COMPONENT_TAGS = (
     "Pickable",
     "MeleeWeapon",
     "Wearable",
+    "Projectile",
 )
 
 
@@ -349,91 +217,129 @@ def has_behavior_component(item: ET.Element) -> bool:
     return False
 
 
-def item_is_deletable(item: ET.Element, safe_ids: set) -> bool:
+def get_tags(item: ET.Element) -> set[str]:
     """
-    Items to delete must:
-      1) Have an ID not in safe_ids
-      2) Have Tags containing at least one of TARGET_TAGS
-      3) NOT have a <Holdable Attached="True" ...> subnode
+    Return a set of lowercase tag tokens from item.Tags / item.tags.
     """
-    item_id = item.get("ID")
-    if not item_id:
-        return False
-    if item_id in safe_ids:
-        return False
-
-    raw_tags = (
+    raw = (
         item.get("Tags")
         or item.get("tags")
         or ""
     )
-    tag_tokens = {
+    return {
         t.strip().lower()
-        for t in re.split(r"[,\s]+", raw_tags)
+        for t in re.split(r"[,\s]+", raw)
         if t.strip()
     }
 
-    if not (tag_tokens & TARGET_TAGS):
-        return False
 
-    for holdable in item.findall("Holdable"):
-        attached = holdable.get("Attached")
-        if attached is not None and attached.lower() == "true":
+def build_safe_ids(root: ET.Element) -> set[str]:
+    """
+    Build SAFE_LIST of item IDs that must NOT be deleted, based on:
+
+    1. Circuit boxes:
+       - <Item identifier="circuitbox" ...> with <Holdable Attached="True">
+       - plus all IDs in their ItemContainer.contained attributes
+         (both comma and semicolon separated).
+
+    2. Placed components:
+       - <Item Tags="...circuitboxcomponent..." ...> with <Holdable Attached="True">
+
+    3. Placed/attached wires:
+       - <Item Tags="...wire..." ...> with a <Wire nodes="..."> subnode.
+
+    4. All attached items:
+       - Any <Item> with <Holdable Attached="True">.
+    """
+    safe_ids: set[str] = set()
+
+    for item in root.iter("Item"):
+        item_id = item.get("ID")
+        if not item_id:
+            continue
+
+        identifier = (item.get("identifier") or "").lower()
+        tags = get_tags(item)
+
+        # Helper: does this item have a Holdable with Attached="True"?
+        def has_attached_holdable(it: ET.Element) -> bool:
+            for h in it.findall("Holdable"):
+                attached = h.get("Attached")
+                if attached is not None and attached.lower() == "true":
+                    return True
             return False
 
-    return True
+        # 1. Circuit boxes + their contained IDs
+        if identifier == "circuitbox" and has_attached_holdable(item):
+            safe_ids.add(item_id)
+            for ic in item.findall("ItemContainer"):
+                contained = ic.get("contained", "")
+                if contained:
+                    for cid in re.findall(r"\d+", contained):
+                        safe_ids.add(cid)
+
+        # 2. Placed components (tag=circuitboxcomponent + attached)
+        if "circuitboxcomponent" in tags and has_attached_holdable(item):
+            safe_ids.add(item_id)
+
+        # 3. Placed/attached wires (tag=wire + Wire nodes)
+        if "wire" in tags:
+            for wire in item.findall("Wire"):
+                nodes_attr = wire.get("nodes")
+                if nodes_attr and nodes_attr.strip():
+                    safe_ids.add(item_id)
+                    break
+
+        # 4. All attached items in general
+        if has_attached_holdable(item):
+            safe_ids.add(item_id)
+
+    return safe_ids
 
 
-def remove_deleted_ids_from_contained(value: str, deleted_ids: set[str]) -> str:
+def cleanup_contained(value: str, existing_ids: set[str]) -> str:
     """
     Remove IDs from a contained string by deleting only the digits of IDs
-    that were deleted, preserving commas/semicolons exactly.
+    that do not have a matching <Item ID="...">, preserving commas/semicolons.
+
+    Example:
+      value = "1,2,3,4"
+      existing_ids = {"3", "4"}
+      result = ",,,3,4"  (but note: separators preserved; digits removed where missing)
     """
-    if not value or not deleted_ids:
+    if not value:
         return value
 
     def repl(match: re.Match) -> str:
         token = match.group(0)
-        return "" if token in deleted_ids else token
+        return token if token in existing_ids else ""
 
     return re.sub(r"\d+", repl, value)
 
 
-def delete_tagged_items(tree: ET.ElementTree, exclude_identifiers: set) -> int:
+def delete_items(tree: ET.ElementTree) -> int:
     """
-    Deletion logic:
+    Implements the new deletion logic:
 
-    1. Build safe-from-deletion ID set from EXCLUDE_ITEMS graph.
-    2. Add to safe set:
-         - all IDs referenced by any <link w="...">
-         - all IDs of Items that have NO behavior component subnodes.
-    3. Delete any <Item> whose ID is not safe and which:
-         - has required tags, and
-         - is not a Holdable with Attached="True".
-    4. Remove deleted IDs from all ItemContainer.contained attributes
-       by deleting only the digits and preserving separators.
+    1. Build SAFE_LIST of IDs that must NOT be deleted.
+    2. Delete any <Item> that:
+         - has one of the behavior subnodes (Holdable/Throwable/Growable/Pickable/MeleeWeapon/Wearable), AND
+         - has an ID not in SAFE_LIST.
+    3. Cleanup:
+         - For every ItemContainer.contained, remove IDs that don't exist anymore,
+           but keep commas/semicolons.
+         - Remove any <link w="..."> whose ID no longer exists.
     """
     root = tree.getroot()
 
-    parent_map, id_to_item, container_to_children, child_to_containers = build_maps_for_items(root)
-    safe_ids = build_safe_ids(id_to_item, container_to_children, child_to_containers, exclude_identifiers)
-    print(f"[DEBUG] Safe IDs from EXCLUDE_ITEMS graph: {len(safe_ids)}")
+    # Parent map for deletions
+    parent_map = {child: parent for parent in root.iter() for child in parent}
 
-    # IDs referenced by links
-    link_safe_ids = collect_link_w_ids(root, id_to_item)
-    safe_ids.update(link_safe_ids)
-    print(f"[DEBUG] Additional safe IDs from <link w=\"...\">: {len(link_safe_ids)}")
+    # 1. SAFE_LIST
+    safe_ids = build_safe_ids(root)
+    print(f"[DEBUG] SAFE_LIST size: {len(safe_ids)}")
 
-    # Items with no behavior components
-    static_added = 0
-    for item_id, item in id_to_item.items():
-        if item_id in safe_ids:
-            continue
-        if not has_behavior_component(item):
-            safe_ids.add(item_id)
-            static_added += 1
-    print(f"[DEBUG] Additional safe IDs from static items (no behavior components): {static_added}")
-
+    # 2. Delete items not in SAFE_LIST that have behavior components
     deleted_ids: set[str] = set()
 
     for item in list(root.iter("Item")):
@@ -441,22 +347,41 @@ def delete_tagged_items(tree: ET.ElementTree, exclude_identifiers: set) -> int:
         if not item_id:
             continue
 
-        if item_is_deletable(item, safe_ids):
+        if item_id in safe_ids:
+            continue
+
+        if has_behavior_component(item):
             parent = parent_map.get(item)
             if parent is not None:
                 parent.remove(item)
                 deleted_ids.add(item_id)
 
-    if deleted_ids:
-        for item in root.iter("Item"):
-            for ic in item.findall("ItemContainer"):
-                contained = ic.get("contained", "")
-                if not contained:
-                    continue
-                cleaned = remove_deleted_ids_from_contained(contained, deleted_ids)
-                ic.set("contained", cleaned)
-
     print(f"[INFO] Items deleted this file: {len(deleted_ids)}")
+
+    # 3. Cleanup references based on *existing* items after deletion
+    existing_ids: set[str] = set()
+    for item in root.iter("Item"):
+        item_id = item.get("ID")
+        if item_id:
+            existing_ids.add(item_id)
+
+    # 3.1 Cleanup ItemContainer.contained
+    for item in root.iter("Item"):
+        for ic in item.findall("ItemContainer"):
+            contained = ic.get("contained", "")
+            if not contained:
+                continue
+            cleaned = cleanup_contained(contained, existing_ids)
+            ic.set("contained", cleaned)
+
+    # 3.2 Cleanup <link w="..."> pointing to non-existing items
+    for link in list(root.iter("link")):
+        w = link.get("w")
+        if not w or w not in existing_ids:
+            parent = parent_map.get(link)
+            if parent is not None:
+                parent.remove(link)
+
     return len(deleted_ids)
 
 
@@ -466,7 +391,6 @@ def process_sub_file(
     path: Path,
     output_dir: Path,
     strip_items: bool,
-    exclude_identifiers: set,
     strip_upgrades: bool,
 ) -> None:
     print(f"[INFO] Processing {path.name} ...")
@@ -483,7 +407,7 @@ def process_sub_file(
         print("[INFO] Skipping upgrade stripping (STRIP_UPGRADES = false)")
 
     if strip_items:
-        deleted_items = delete_tagged_items(tree, exclude_identifiers)
+        deleted_items = delete_items(tree)
         print(
             f"[INFO] Finished item stripping for {path.name}, "
             f"deleted {deleted_items} item(s)"
@@ -502,7 +426,7 @@ def main() -> None:
     print(f"{APP_NAME} v{VERSION}")
     print("-" * 40)
 
-    strip_items, exclude_identifiers, strip_upgrades = load_settings()
+    strip_items, strip_upgrades = load_settings()
 
     if not INPUT_DIR.exists():
         print(f"[ERROR] Input folder not found: {INPUT_DIR}")
@@ -523,7 +447,7 @@ def main() -> None:
 
     for sub_path in sub_files:
         try:
-            process_sub_file(sub_path, OUTPUT_DIR, strip_items, exclude_identifiers, strip_upgrades)
+            process_sub_file(sub_path, OUTPUT_DIR, strip_items, strip_upgrades)
         except Exception as e:
             print(f"[ERROR] Error processing {sub_path.name}: {e!r}")
 
