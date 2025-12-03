@@ -1,5 +1,7 @@
 # Barotrauma Submarine Stripper
 
+![banner.png](images/banner/banner.png)
+
 Barotrauma Submarine Stripper is a small utility that helps you reset a submarine before starting a new Barotrauma campaign.
 
 It works on extracted `.sub` files and can:
