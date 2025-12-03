@@ -5,7 +5,6 @@ from pathlib import Path
 import gzip
 import re
 import xml.etree.ElementTree as ET
-from configparser import ConfigParser
 
 # ---------- Constants / paths ----------
 
@@ -22,50 +21,22 @@ else:
 
 INPUT_DIR = BASE_DIR / "input"
 OUTPUT_DIR = BASE_DIR / "output"
-SETTINGS_PATH = BASE_DIR / "settings.ini"
 
 
-# ---------- Settings ----------
+# ---------- Small helpers ----------
 
-def safe_getboolean(cfg: ConfigParser, section: str, option: str, default: bool) -> bool:
+def ask_yes_no(prompt: str) -> bool:
     """
-    Get a boolean from the config safely.
-    Any error (missing section/option, invalid value) -> print and return default.
+    Ask a yes/no question and return True for 'y', False for 'n'.
+    Any other input repeats the question.
     """
-    try:
-        value = cfg.getboolean(section, option)
-        return value
-    except Exception as e:
-        print(f"[WARN] Invalid or missing boolean for [{section}] {option}: {e!r}. Using default {default}")
-        return default
-
-
-def load_settings():
-    """
-    Load settings from settings.ini.
-    If the file doesn't exist, create it with default values.
-    Returns (strip_items: bool, strip_upgrades: bool).
-    """
-    cfg = ConfigParser()
-
-    if not SETTINGS_PATH.exists():
-        cfg["Settings"] = {
-            "STRIP_ITEMS": "false",
-            "STRIP_UPGRADES": "true",
-        }
-        with SETTINGS_PATH.open("w", encoding="utf-8") as f:
-            cfg.write(f)
-        print(f"[INFO] settings.ini not found, created default at {SETTINGS_PATH}")
-
-    cfg.read(SETTINGS_PATH, encoding="utf-8")
-
-    strip_items = safe_getboolean(cfg, "Settings", "STRIP_ITEMS", False)
-    strip_upgrades = safe_getboolean(cfg, "Settings", "STRIP_UPGRADES", True)
-
-    print(f"[INFO] STRIP_ITEMS = {strip_items}")
-    print(f"[INFO] STRIP_UPGRADES = {strip_upgrades}")
-
-    return strip_items, strip_upgrades
+    while True:
+        answer = input(prompt + " ").strip().lower()
+        if answer == "y":
+            return True
+        if answer == "n":
+            return False
+        print("Please answer with 'y' or 'n'.")
 
 
 # ---------- File IO ----------
@@ -100,7 +71,7 @@ def write_xml_as_sub(tree: ET.ElementTree, out_path: Path) -> None:
     out_path.write_bytes(compressed)
 
 
-# ---------- Upgrade removal (unchanged) ----------
+# ---------- Upgrade removal ----------
 
 def find_attr_case_insensitive(attrib: dict, name_lower: str):
     """
@@ -193,7 +164,7 @@ def remove_extra_stacksize_stats(tree: ET.ElementTree) -> int:
     return removed
 
 
-# ---------- Item deletion (new SAFE_LIST-based logic) ----------
+# ---------- Item deletion (SAFE_LIST-based logic) ----------
 
 BEHAVIOR_COMPONENT_TAGS = (
     "Holdable",
@@ -305,7 +276,7 @@ def cleanup_contained(value: str, existing_ids: set[str]) -> str:
     Example:
       value = "1,2,3,4"
       existing_ids = {"3", "4"}
-      result = ",,,3,4"  (but note: separators preserved; digits removed where missing)
+      result = ",,,3,4" (digits removed where missing; separators kept)
     """
     if not value:
         return value
@@ -319,7 +290,7 @@ def cleanup_contained(value: str, existing_ids: set[str]) -> str:
 
 def delete_items(tree: ET.ElementTree) -> int:
     """
-    Implements the new deletion logic:
+    Implements the deletion logic:
 
     1. Build SAFE_LIST of IDs that must NOT be deleted.
     2. Delete any <Item> that:
@@ -404,7 +375,7 @@ def process_sub_file(
         extra_stack_removed = remove_extra_stacksize_stats(tree)
         print(f"[INFO] Removed {extra_stack_removed} ExtraStackSize Stat node(s)")
     else:
-        print("[INFO] Skipping upgrade stripping (STRIP_UPGRADES = false)")
+        print("[INFO] Skipping upgrade stripping")
 
     if strip_items:
         deleted_items = delete_items(tree)
@@ -413,7 +384,7 @@ def process_sub_file(
             f"deleted {deleted_items} item(s)"
         )
     else:
-        print("[INFO] Skipping item stripping (STRIP_ITEMS = false)")
+        print("[INFO] Skipping item stripping")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / path.name
@@ -426,8 +397,18 @@ def main() -> None:
     print(f"{APP_NAME} v{VERSION}")
     print("-" * 40)
 
-    strip_items, strip_upgrades = load_settings()
+    # Ask user what to do
+    strip_upgrades = ask_yes_no("Strip submarines' upgrades? (y/n)")
+    strip_items = ask_yes_no("Strip submarines' items? (y/n)")
 
+    if not strip_upgrades and not strip_items:
+        print("[INFO] Both options disabled. No changes will be made.")
+        print("[INFO] No output files will be created.")
+        if getattr(sys, "frozen", False):
+            input("\nPress Enter to exit...")
+        return
+
+    # Input folder check
     if not INPUT_DIR.exists():
         print(f"[ERROR] Input folder not found: {INPUT_DIR}")
         print("[INFO] Create an 'input' folder next to the tool and drop your .sub files in it.")
