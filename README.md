@@ -6,8 +6,8 @@ Barotrauma Submarine Stripper is a small utility that helps you reset a submarin
 
 It works on extracted `.sub` files and can:
 
-- Remove **upgrades** from your sub (walls, junction boxes, pumps, etc.).
-- Remove most **loose and stored items** (gear, ammo, crates, clutter, etc.) while keeping wiring and important fixtures.
+- Strips **upgrades** from your sub (walls, junction boxes, pumps, etc.).
+- Strips most **loose and stored items** (gear, ammo, crates, clutter, etc.) while keeping wiring and important fixtures.
 
 You don’t need to edit XML or touch the sub editor manually.
 
@@ -28,8 +28,8 @@ When you run the tool, it will ask you on runtime if you want to strip upgrades 
 
 - **`y` (yes)**  
   - Resets built-in upgrades on the submarine (for example upgraded walls, junction boxes, pumps, etc.).  
-  - Removes "Jenga Master" assistant perk permanent stack upgrade in containers.
-  - Removes upgrade data so the sub is back to its base stats.
+  - Strips "Jenga Master" assistant perk permanent stack upgrade in containers.
+  - Strips upgrade data so the sub is back to its base stats.
 
 - **`n` (no)**  
   - Leaves all upgrades exactly as they are in the `.sub` file.
@@ -37,7 +37,7 @@ When you run the tool, it will ask you on runtime if you want to strip upgrades 
 ### Strip submarines' items? (y/n)
 
 - **`y` (yes)**  
-  - Removes most loose / pickable items from the submarine:
+  - Strips most loose / pickable items from the submarine:
     - Gear, ammo, crates, random clutter, etc.
   - Keeps important placed elements such as:
     - Wiring
